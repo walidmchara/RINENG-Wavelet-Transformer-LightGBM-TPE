@@ -3,6 +3,7 @@ from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import numpy as np
 import torch
+import pytest
 from models import make_model, MorletBank
 from core import FuzzyCMeans, prepare, demo_data, metrics
 
@@ -27,6 +28,19 @@ def test_temporal_splits_and_scaler():
     assert len(s['train'][0]) and len(s['test'][0])
     assert m['train_end']<m['validation_end']<m['n_rows']
     assert s['test'][0].shape[-1]==len(m['features'])+2
+    assert m['split_times']['train']['end']<m['split_times']['calib']['start']
+    assert m['split_times']['calib']['end']<m['split_times']['val']['start']
+    assert m['split_times']['val']['end']<m['split_times']['test']['start']
+
+def test_prepare_rejects_bad_values_and_columns():
+    df=demo_data(180)
+    df.loc[10,'target']=np.inf
+    with pytest.raises(ValueError,match='infinite'):
+        prepare(df,24)
+    with pytest.raises(ValueError,match='missing feature'):
+        prepare(demo_data(180),24,feature_cols=['not_a_column'])
+    with pytest.raises(ValueError,match='positive'):
+        prepare(demo_data(180),0)
 
 def test_metrics():
     x=metrics([1,2,3],[1,2,3],'battery_soh')

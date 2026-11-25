@@ -8,7 +8,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
       - run: python -m pip install -r requirements.txt
       - run: python -m pytest -q
-      - run: python train.py --smoke --epochs 1 --out outputs/ci
-      - run: python train.py --smoke --epochs 1 --out outputs/ci --resume
+      - run: python train.py --smoke --search none --epochs 1 --out outputs/ci
+      - run: python train.py --smoke --search none --epochs 1 --out outputs/ci --resume
+      - run: python train.py --smoke --search paper --trials 1 --epochs 1 --out outputs/ci-search
