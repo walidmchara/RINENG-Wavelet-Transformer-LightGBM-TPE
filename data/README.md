@@ -10,11 +10,33 @@ For meteorological forecasting, typical candidate predictors include temperature
 
 A CSV may use the fields `time`, predictor columns, and `target`. The `time` field defines the observation order; predictors are numerical and should be screened for missing readings and inconsistent units.
 
-The implementation uses train-only normalization and a chronological training, calibration, validation and test division. Past target observations may be used autoregressively, but future and same-forecast-horizon targets must not enter the input window.
+Example header and rows:
+
+```csv
+time,temperature,cloud_cover,target
+2024-06-01T10:00:00,23.1,0.2,612.4
+2024-06-01T10:15:00,23.4,0.3,588.7
+```
+
+Rows are stably sorted by `time` if that column exists; otherwise the input
+row order is assumed chronological and a warning is emitted. Use consistent
+sampling intervals, finite numeric values, and at least 80 records. Missing
+values are rejected rather than silently imputed. The implementation uses
+train-only normalization and chronological training, calibration, validation,
+and test divisions. Past target observations may be used autoregressively, but
+future and same-forecast-horizon targets must not enter the input window.
+Inputs are windows of `--lookback` prior rows; labels are the next row's
+target, so this is a one-step-ahead forecast.
 
 ```bash
 python train.py --csv path/to/measurements.csv --target target --time-col time --epochs 40 --out outputs/experiment
 ```
+
+For other column names, pass `--target` and `--time-col`; use
+`--features feature_a,feature_b` to explicitly select predictors. The target
+is appended automatically for autoregressive input. If timestamps are absent,
+use `--time-col ""` to suppress the missing-time warning only when the file is
+already correctly ordered.
 
 ## Experimental controls
 

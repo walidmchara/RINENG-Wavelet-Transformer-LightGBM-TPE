@@ -2,7 +2,7 @@
 
 Never confuse the '--smoke' synthetic demo with the article's reported results.
 """
-import argparse,json,math,time,hashlib
+import argparse,json,math,hashlib,platform
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -12,12 +12,21 @@ from models import make_model
 from core import prepare,seed_all,demo_data,metrics
 from training_recovery import EpochCheckpoint
 
+def file_sha256(path):
+    digest=hashlib.sha256()
+    with Path(path).open('rb') as source:
+        for chunk in iter(lambda:source.read(1024*1024),b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
 def train_one(split, meta, cfg, epochs=None, quiet=False, recovery=None, resume=False):
+    epochs=epochs if epochs is not None else cfg['epochs']
+    if epochs<1:raise ValueError('epochs must be at least 1')
     seed_all(cfg['seed'])
     net=make_model(cfg['family'],meta['input_features'],cfg['hidden'],cfg['dropout'])
     optimizer=torch.optim.Adam(net.parameters(),lr=cfg['learning_rate'])
     loader=DataLoader(TensorDataset(*split['train']),batch_size=cfg['batch_size'],shuffle=True)
-    xval,yval=split['val']; epochs=epochs if epochs is not None else cfg['epochs']
+    xval,yval=split['val']
     best=math.inf;best_weights=None;history=[];start_epoch=0
     if resume:
         if recovery is None: raise ValueError('Recovery directory is required for resume')
@@ -99,13 +108,21 @@ def run(args):
     cfg=json.loads(Path(__file__).with_name('config.json').read_text())
     for k in ['epochs','lookback','batch_size','hidden','seed']:
         if getattr(args,k,None) is not None:cfg[k]=getattr(args,k)
+    if args.family:cfg['family']=args.family
+    if args.residual:cfg['residual']=args.residual
+    if cfg['epochs']<1:raise ValueError('epochs must be at least 1')
+    if cfg['lookback']<1:raise ValueError('lookback must be at least 1')
+    if cfg['batch_size']<1:raise ValueError('batch size must be at least 1')
+    if cfg['hidden']<4 or cfg['hidden']%4:raise ValueError('hidden size must be a positive multiple of 4')
     if args.smoke:df=demo_data(domain=cfg['domain'],seed=cfg['seed'])
     elif args.csv:df=pd.read_csv(args.csv)
     else:raise SystemExit('Provide --csv PATH for real data or --smoke for a synthetic test')
-    selected=args.features.split(',') if args.features else None
+    selected=[c.strip() for c in args.features.split(',')] if args.features else None
+    if selected and any(not c for c in selected):raise ValueError('--features contains an empty column name')
     split,meta=prepare(df,cfg['lookback'],feature_cols=selected,target=args.target,time_col=args.time_col,clusters=cfg['n_clusters'],seed=cfg['seed'])
     if any(len(x[0])<1 for x in split.values()):raise ValueError('empty subset: reduce lookback or increase dataset')
     technique=(cfg['optimizer'] if args.search=='paper' else args.search)
+    if technique!='none' and args.trials<1:raise ValueError('--trials must be at least 1 when hyperparameter search is enabled')
     search_report=None
     if technique!='none':
         def objective(p):
@@ -120,7 +137,7 @@ def run(args):
             'warning':'CBO search is illustrative, not a verified implementation of paper equations' if technique=='cbo' else None}
     if args.resume and technique!='none':
         raise ValueError('Resume with hyperparameter search is not supported; use --search none')
-    source_signature = (hashlib.sha256(Path(args.csv).read_bytes()).hexdigest()
+    source_signature = (file_sha256(args.csv)
                         if args.csv and not args.smoke else 'synthetic_smoke_seed_'+str(cfg['seed']))
     recovery = EpochCheckpoint(args.checkpoint_dir or Path(args.out)/'recovery', {
         'training_config':cfg,'source_sha256':source_signature,'smoke':args.smoke,
@@ -142,12 +159,22 @@ def run(args):
         residual_fitted=True
     out=Path(args.out);out.mkdir(parents=True,exist_ok=True)
     torch.save({'model_state_dict':net.state_dict(),'config':cfg,'meta':meta},out/'checkpoint.pt')
+    residual_artifact=None
+    if residual_fitted:
+        residual_artifact='residual_model.txt' if cfg['residual']=='lightgbm' else 'residual_model.json'
+        if cfg['residual']=='lightgbm':model.booster_.save_model(str(out/residual_artifact))
+        else:model.save_model(str(out/residual_artifact))
     pd.DataFrame(history).to_csv(out/'training_log.csv',index=False)
     pd.DataFrame({'actual':ground,'neural_prediction':neural,'final_prediction':corrected}).to_csv(out/'predictions.csv',index=False)
     result={'paper_doi':cfg['doi'],'run_kind':'synthetic smoke test' if args.smoke else 'user-provided data experiment',
             'model_family':cfg['family'],'config':cfg,'data_meta':meta,
             'neural_metrics':metrics(ground,neural,cfg['domain']),
-            'final_metrics':metrics(ground,corrected,cfg['domain']),'residual_model_fit':residual_fitted,'search':search_report,
+            'final_metrics':metrics(ground,corrected,cfg['domain']),'residual_model_fit':residual_fitted,
+            'residual_model_artifact':residual_artifact,'source_sha256':source_signature,
+            'training_rows':{name:len(values[0]) for name,values in split.items()},
+            'software_versions':{'python':platform.python_version(),'numpy':np.__version__,
+                                 'pandas':pd.__version__,'torch':torch.__version__},
+            'search':search_report,
             'IMPORTANT':'These are newly computed run metrics; NOT published paper results.'}
     (out/'metrics.json').write_text(json.dumps(result,indent=2))
     try:
@@ -163,7 +190,9 @@ if __name__=='__main__':
     ap.add_argument('--csv');ap.add_argument('--smoke',action='store_true');ap.add_argument('--features',help='comma-separated feature column names; target is always appended')
     ap.add_argument('--target',default='target');ap.add_argument('--time-col',default='time');ap.add_argument('--lookback',type=int)
     ap.add_argument('--epochs',type=int);ap.add_argument('--batch-size',type=int);ap.add_argument('--hidden',type=int);ap.add_argument('--seed',type=int)
-    ap.add_argument('--search',choices=['paper','none','woa','cbo','optuna'],default='none',help='paper selects optimizer declared in associated paper')
+    ap.add_argument('--family',choices=['wavelet_transformer','cnn_wavelet_bilstm','fuzzy_bilstm','fuzzy_informer','fuzzy_transformer','whdmnet'])
+    ap.add_argument('--residual',choices=['lightgbm','xgboost','none'])
+    ap.add_argument('--search',choices=['paper','none','woa','cbo','optuna'],default='paper',help='paper selects optimizer declared in config.json')
     ap.add_argument('--trials',type=int,default=5);ap.add_argument('--out',default='outputs/latest')
     ap.add_argument('--checkpoint-dir',help='Persistent recovery path (Drive or mounted volume)')
     ap.add_argument('--resume',action='store_true',help='Continue from last completed epoch')

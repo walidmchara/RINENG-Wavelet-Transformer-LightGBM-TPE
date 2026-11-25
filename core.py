@@ -1,6 +1,5 @@
 """Leakage-aware dataset preparation, FCM and evaluation utilities."""
-import json,math,random
-from pathlib import Path
+import json,math,random,warnings
 import numpy as np
 import pandas as pd
 import torch
@@ -39,16 +38,31 @@ def demo_data(n=240,seed=42,domain='solar_irradiance'):
     return pd.DataFrame({'time':t,'temperature':weather,'cloud_cover':cloud,'solar_elevation':sun,'target':target})
 
 def prepare(df,lookback,feature_cols=None,target='target',time_col='time',clusters=0,seed=42):
+    if lookback < 1:
+        raise ValueError('lookback must be a positive integer')
+    if clusters < 0:
+        raise ValueError('clusters must be nonnegative')
     df=df.copy()
-    if time_col in df:df=df.sort_values(time_col,kind='stable').reset_index(drop=True)
+    if time_col in df:
+        if df[time_col].isna().any():raise ValueError(f'time column {time_col!r} contains missing values')
+        df=df.sort_values(time_col,kind='stable').reset_index(drop=True)
+    elif time_col:
+        warnings.warn(f'time column {time_col!r} not found; assuming CSV row order is chronological',UserWarning)
     if target not in df:raise ValueError(f'missing target column {target!r}')
     if feature_cols is None:
         feature_cols=[c for c in df.select_dtypes(include='number').columns if c!=time_col]
+    else:
+        missing=[c for c in feature_cols if c not in df.columns]
+        if missing:raise ValueError(f'missing feature columns: {missing}')
+        feature_cols=list(feature_cols)
     if target not in feature_cols:feature_cols.append(target)
+    if len(set(feature_cols))!=len(feature_cols):raise ValueError('feature columns must be unique')
     if len(df)<max(80,lookback+30):raise ValueError('need >= 80 records with enough historical context')
     for c in feature_cols:df[c]=pd.to_numeric(df[c],errors='coerce')
     if df[feature_cols].isna().any().any():
         raise ValueError('missing/non-numeric data; clean or impute before splitting (train-only imputation recommended)')
+    if not np.isfinite(df[feature_cols].to_numpy(dtype=np.float64)).all():
+        raise ValueError('data contains infinite values; clean or impute before training')
     X=df[feature_cols].to_numpy(dtype=np.float32)
     y=df[target].to_numpy(dtype=np.float32)
     train_end=int(.70*len(df));valid_end=int(.85*len(df))
@@ -58,6 +72,7 @@ def prepare(df,lookback,feature_cols=None,target='target',time_col='time',cluste
     X=(X-mean)/std;yn=(y-ym)/ys
     fcm=None
     if clusters:
+        if clusters>train_end:raise ValueError('n_clusters cannot exceed the number of training rows')
         fcm=FuzzyCMeans(clusters,seed=seed).fit(X[:train_end])
         U=fcm.transform(X).astype(np.float32)
         X=np.concatenate([X,U],axis=1)
@@ -72,6 +87,11 @@ def prepare(df,lookback,feature_cols=None,target='target',time_col='time',cluste
     meta={'features':feature_cols,'input_features':X.shape[1],'n_rows':len(df),'lookback':lookback,
           'train_end':train_end,'calibration_start':calib_start,'validation_end':valid_end,
           'target_mean':ym,'target_std':ys,'x_mean':mean.tolist(),'x_std':std.tolist(),
+          'time_col':time_col if time_col in df else None,
+          'split_times':None if time_col not in df else {
+              name:{'start':str(df.iloc[int(indices[mask][0])][time_col]),
+                    'end':str(df.iloc[int(indices[mask][-1])][time_col])}
+              for name,mask in masks.items() if mask.any()},
           'fcm_centroids':None if fcm is None else fcm.centers.tolist()}
     return split,meta
 
